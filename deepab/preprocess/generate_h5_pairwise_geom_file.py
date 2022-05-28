@@ -141,6 +141,23 @@ def antibody_to_h5(pdb_dir,
                 print(msg.format(file, name))
 
 
+
+def run(pdb_dir,
+        fasta_dir,
+        out_file,
+        overwrite=True,
+        print_progress=True):
+    '''
+    
+    '''
+    antibody_to_h5(pdb_dir,
+                   out_file,
+                   fasta_dir=fasta_dir,
+                   overwrite=overwrite,
+                   print_progress=print_progress)
+
+
+
 def cli():
     desc = 'Creates h5 files from all the truncated antibody PDB files in a directory'
     parser = argparse.ArgumentParser(description=desc)
@@ -176,10 +193,10 @@ def cli():
     out_file = args.out_file
     overwrite = args.overwrite
 
-    antibody_to_h5(pdb_dir,
-                   out_file,
-                   fasta_dir=fasta_dir,
-                   overwrite=overwrite,
+    antibody_to_h5(args.pdb_dir,
+                   args.fasta_dir,
+                   args.out_file,
+                   overwrite=args.overwrite,
                    print_progress=True)
 
 

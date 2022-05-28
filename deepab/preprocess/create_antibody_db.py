@@ -17,32 +17,108 @@
 ## For the purpose of trimming, truncate the heavy @112 and light @109
 ## Some directories (antibody_database, info, etc...) are hard coded.
 
-import os
-import sys
-import requests
-import pandas as pd
+
 import argparse
-from Bio import SeqIO
-from pathlib import Path
-from bs4 import BeautifulSoup
-from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import io
+import os
+from pathlib import Path
+import requests
+import sys
+import time
+import traceback
 
-import deepab
+from os.path import basename
+
+import pandas as pd
+
+from Bio import SeqIO
+from Bio.PDB import PDBParser, PDBIO
+from Bio.SeqUtils import seq1
+
+from bs4 import BeautifulSoup
+
+from tqdm import tqdm
+
+from abutils.io import list_files
+from abutils.utils.alignment import local_alignment
+
 from deepab.util.pdb import get_pdb_chain_seq
-from deepab.util.util import RawTextArgumentDefaultsHelpFormatter
-
-# Relative paths from deepab/data
-_DEFAULT_SUMMARY_FILE_PATH = 'info/sabdab_summary.tsv'
-_DEFAULT_ANTIBODY_DATABASE_PATH = 'antibody_database/'
-_TESTSET_FILENAME_ = 'TestSetList.txt'
 
 
+
+#---------------------------
+#         SAbDab
+#---------------------------
+
+
+def download_sabdab_summary_file(summary_file,
+                                 seqid=99,
+                                 paired=True,
+                                 nr_complex='All',
+                                 nr_rfactor='',
+                                 nr_res=4):
+    '''
+    Downloads a summary data file from the Structural Antibody Database 
+    (`SAbDab`_) [Schneider22]_.
+
+    .. seealso::
+       | C Schneider, MIJ Raybould, CM Deane 
+       | SAbDab in the Age of Biotherapeutics: Updates including SAbDab-Nano, the Nanobody Structure Tracker  
+       | *Nucleic Acids Research* 2022. https://doi.org/10.1093/nar/gkab1050  
+
+    Parameters
+    ----------
+    summary_file : str
+        Path to which the summary file data will be written, in tab-delimited 
+        format. Directories will be created if they do not exist. Required.
+
+    seqid : int or float, default=99
+        Sequence identity at which to group antibodies from SAbDab. Only one 
+        sequences from each group will be downloaded. 
+
+    paired : bool, default=True
+        If ``True``, only sequences with paired H/L chains will be downloaded. 
+
+    nr_complex : str, default='All'
+        Types of structural complexes to download. Options are ``'All'``, 
+        ``'Bound'``, or ``'Unbound'``.
+
+    nr_rfactor : str, default=''
+        R-factor cutoff. If not provided, no cutoff is used.
+
+    nr_res : int or float, default=4
+        Minimum resolution (in angstroms) of downloaded structures.
+
+    .. _SAbDab: http://opig.stats.ox.ac.uk/webapps/newsabdab/sabdab/search/
+    '''
+    base_url = 'http://opig.stats.ox.ac.uk'
+    search_url = base_url + '/webapps/newsabdab/sabdab/search/'
+    params = dict(seqid=seqid,
+                  paired=paired,
+                  nr_complex=nr_complex,
+                  nr_rfactor=nr_rfactor,
+                  nr_res=nr_res)
+    query = requests.get(search_url, params=params)
+    html = BeautifulSoup(query.content, 'html.parser')
+    summary_url = base_url + html.find(id='downloads').find('a').get('href')
+    download_file(summary_url, summary_file)
+        
+        
 def parse_sabdab_summary(file_name):
     """
-    SAbDab produces a rather unique summary file.
-    This function reads that file into a dict with the key being the
-    4-letter PDB code.
+    Parses SAbDab summary file
+
+    Parameters
+    ----------
+    file_name : str
+        Path to a SAbDab summary file, in tab-delimited format.
+
+    Returns
+    -------
+    sabdab_dict : dict
+        A dictionary containing SAbDab summary data, with the format:
+        ``sabdab_dict[pdb_id] = {column1: value1, column2: value2 ...}``
     """
     # dict[pdb] = {col1 : value, col2: value, ...}
     sabdab_dict = {}
@@ -59,79 +135,199 @@ def parse_sabdab_summary(file_name):
                 td[k] = v
             # add temporary dict to sabdab dict at the pdb id
             sabdab_dict[split_line[0]] = td
-
     return sabdab_dict
 
 
-def truncate_chain(pdb_text, chain, resnum, newchain):
+
+#---------------------------
+#          PDBs
+#---------------------------
+
+
+def download_pdb_files(pdb_ids,
+                       download_path,
+                       max_workers=16,
+                       logfile=None):
     """
-    Read PDB line by line and return all lines for a chain,
-    with a resnum less than or equal to the input.
-    This has to be permissive for insertion codes.
-    This will return only a single truncated chain.
-    This function can update chain to newchain.
+    :param pdb_ids: A set of PDB IDs to download
+    :type pdb_ids: set(str)
+    :param antibody_database_path: Path to the directory to save the PDB files to.
+    :type antibody_database_path: str
+    :param max_workers: Max number of workers in the thread pool while downloading.
+    :type max_workers: int
     """
-    trunc_text = ""
-    for line in pdb_text.split("\n"):
-        if (line.startswith("ATOM") and line[21] == chain
-                and int(line[22:26]) <= resnum):
-            trunc_text += line[:21] + newchain + line[22:]
-            trunc_text += "\n"
-    return trunc_text
+    print('\ndownloading PDB files:')
+    sys.stdout.flush()
+    pdb_files = [os.path.join(download_path, pdb + '.pdb') for pdb in pdb_ids]
+    download_url = 'http://opig.stats.ox.ac.uk/webapps/newsabdab/sabdab/pdb/{}/?scheme=chothia'
+    urls = [download_url.format(pdb) for pdb in pdb_ids]
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        results = [
+            executor.submit(lambda a: download_file(*a), args)
+            for args in zip(urls, pdb_files)
+        ]
+        for _ in tqdm(as_completed(results), total=len(urls)):
+            pass
+    downloaded_files = list_files(download_path)
+    
+    # logging
+    log_info = []
+    n_downloads = len(downloaded_files)
+    n_pdbs = len(pdb_ids)
+    i = f"{n_downloads} of {n_pdbs} PDB IDs were successfully downloaded"
+    print(i)
+    sys.stdout.flush()
+    log_info.append(i)
+    if n_pdbs > n_downloads:
+        failed = []
+        for pdb_id in pdb_ids:
+            if not any([pdb_id in df for df in downloaded_files]):
+                failed.append(pdb_id)
+        log_info.append('The following PDB IDs were not downloaded:')
+        log_info.extend(failed)
+    if logfile is not None:
+        write_log(logfile, '\n'.join(log_info))
+        
+        
+def process_pdbs(raw_dir,
+                 processed_dir,
+                 sabdab_summary_file,
+                 ignore_single_chains=True,
+                 logfile=None):
+    """
+
+    """
+    print('\nprocessing pdb files:')
+    sys.stdout.flush()
+    pdb_warnings = []
+    same_chains = []
+    sabdab_missing = []
+    
+    # Parse the SAbDab summary file
+    sabdab_dict = parse_sabdab_summary(sabdab_summary_file)
+
+    pdb_files = [f for f in os.listdir(raw_dir) if f.endswith(".pdb")]
+    unique_pdb_ids = set([p[:4] for p in pdb_files])
+
+    for pdb_id in tqdm(unique_pdb_ids):
+        if pdb_id not in sabdab_dict:
+            pdb_file = os.path.join(raw_dir, f'{pdb_id}.pdb')
+            chain_info = parse_pdb_chain_names(pdb_file)
+            if chain_info is None:
+                sabdab_missing.append(pdb_id)
+                continue
+            else:
+                sabdab_dict[pdb_id] = chain_info
+        warn, same_chain = process_pdb(
+                pdb_id,
+                raw_dir,
+                processed_dir,
+                sabdab_dict,
+                ignore_single_chains=ignore_single_chains
+        )
+        if warn is not None:
+            pdb_warnings.append(warn)
+        if same_chain is not None:
+            same_chains.append(same_chain)
+    
+    # logging
+    log_info = []
+    if same_chains:
+        i = f"Removed a total of {len(same_chains)} PDBs with same chain VH/VLs"
+        print(i)
+        sys.stdout.flush()
+        log_info.append(i + ':')
+        log_info.append(f"\t{', '.join(same_chains)}\n")
+    if sabdab_missing:
+        i = f'{len(sabdab_missing)} PDB IDs were not found in the SAbDab summary file'
+        print(i)
+        sys.stdout.flush()
+        log_info.append(i)
+    else:
+        i = 'All PDB IDs were found in the SAbDab summary file.'
+        log_info.append(i)
+    if pdb_warnings:
+        i = f"{len(pdb_warnings)} PDB files had errors during processing"
+        print(i)
+        sys.stdout.flush()
+        log_info.append(i + ':')
+        warns = '\n'.join(pdb_warnings)
+        log_info.append(f"{warns}\n")
+    if logfile is not None:
+        write_log(logfile, '\n'.join(log_info))
 
 
-def truncate_fasta_for_pdb(fasta_file, pdb_file, warn_pdbs, pdb_id=""):
-    fasta_sequences = []
-    for record in SeqIO.parse(fasta_file, "fasta"):
-        s = record.seq._data
-        if type(s) == bytes:
-            s = s.decode()
-        fasta_sequences.append(s)
+def process_pdb(pdb_id,
+                raw_dir,
+                processed_dir,
+                sabdab_dict,
+                ignore_single_chains):
+    """
+    :param pdb_id: The PDB ID of the protein
+    :param antibody_database_path:
+        The path where all the chothia numbered pdb files are stored as [pdb_id].pdb
+    :param ignore_same_VL_VH_chains:
+        Whether or not to ignore a PDB file when its VL chain and VH chains are
+    :type ignore_single_chains: bool
+    """
+    # if an old processed PDB file already exists, delete it
+    raw_pdb = os.path.join(raw_dir, pdb_id + '.pdb')
+    processed_pdb = os.path.join(processed_dir, pdb_id + '.pdb')
+    if os.path.isfile(processed_pdb):
+        os.remove(processed_pdb)
+    
+    # read the raw PDB file
+    if not os.path.isfile(raw_pdb):
+        err = f'MISSING FILE: {pdb_id}'
+        return (err, None)
+    with open(raw_pdb, 'r') as f:
+        pdb_text = f.read()
+    if not pdb_text:
+        err = f'EMPTY FILE: {pdb_id}'
+        return (err, None)
 
-    try:
-        pdb_h_seq = get_pdb_chain_seq(pdb_file, "H")
-        pdb_l_seq = get_pdb_chain_seq(pdb_file, "L")
-    except:
-        print("Missing chain for PDB ID: {}".format(pdb_id))
-        warn_pdbs.append(pdb_id)
-        return
+    # get hchain and lchain data from the SAbDab summary file, if givenj
+    hchain_text, lchain_text = '', ''
+    hchain = sabdab_dict[pdb_id]["Hchain"]
+    lchain = sabdab_dict[pdb_id]["Lchain"]
 
-    if pdb_h_seq == None or pdb_l_seq == None or len(pdb_h_seq) == 0 or len(
-            pdb_l_seq) == 0:
-        bad_h = pdb_h_seq == None or len(pdb_h_seq) == 0
-        print("Missing {} chain seq for PDB: {}".format(
-            "H" if bad_h else "L", pdb_id))
-        warn_pdbs.append(pdb_id)
-        return
+    # we do not currently have a good way of handling VH & VL on the same chain
+    if ignore_single_chains and hchain == lchain:
+        err = f'SINGLE CHAIN: {pdb_id}'
+        return (None, err)
+    
+    # skip PDBs with missing HC or LC (we want paired only)
+    if any([hchain == 'NA', lchain == 'NA']):
+        na = []
+        if hchain == 'NA':
+            na.append('H')
+        if lchain == 'NA':
+            na.append('L')
+        s = 'S' if len(na) > 1 else ''
+        err = f"NA {'/'.join(na)} CHAIN{s}: {pdb_id}"
+        return (err, None)
 
-    cterm_length = 15
-    h_cterm_seq = pdb_h_seq[-cterm_length:]
-    for s in fasta_sequences:
-        if h_cterm_seq in s:
-            trunc_h_seq = s[:s.index(h_cterm_seq) + cterm_length]
-
-    l_cterm_seq = pdb_l_seq[-cterm_length:]
-    for s in fasta_sequences:
-        if l_cterm_seq in s:
-            trunc_l_seq = s[:s.index(l_cterm_seq) + cterm_length]
-
-    try:
-        with open(fasta_file, "w") as f:
-            f.write(">{0}:H\n{1}\n>{0}:L\n{2}\n\n".format(
-                pdb_id, trunc_h_seq, trunc_l_seq))
-    except:
-        print("Failed to write truncated fasta for PDB ID {}".format(pdb_id))
-        print("\tFasta file\t{}".format(fasta_file))
-        print("\tPDB file\t{}".format(pdb_file))
-
-        warn_pdbs.append(pdb_id)
+    # process the PDB data for H and L chains
+    hchain_text = process_chain(pdb_text, hchain, 112, 'H')
+    if not hchain_text:
+        err = f'NO H CHAIN TEXT: {pdb_id}'
+        return (err, None)
+    lchain_text = process_chain(pdb_text, lchain, 109, 'L')
+    if not lchain_text:
+        err = f'NO L CHAIN TEXT: {pdb_id}'
+        return (err, None)
+    
+    # write the processed PDB data
+    with open(processed_pdb, 'w') as f:
+        f.write(hchain_text + lchain_text)
+    return (None, None)
 
 
-def _get_HL_chains(pdb_path):
+def parse_pdb_chain_names(pdb_file):
     """Gets the heavy and light chain ID's from a chothia file from SAbDab"""
     # Get the line with the HCHAIN and LCHAIN
     hl_line = ''
-    with open(pdb_path) as f:
+    with open(pdb_file) as f:
         for line in f.readlines():
             if 'PAIRED_HL' in line:
                 hl_line = line
@@ -146,292 +342,243 @@ def _get_HL_chains(pdb_path):
             h_chain = word.split('=')[1]
         if word.startswith('LCHAIN'):
             l_chain = word.split('=')[1]
-    return h_chain, l_chain
-
-
-def truncate_antibody_pdb(pdb_id, antibody_database_path, same_chain,
-                          warn_pdbs, ignore_same_VL_VH_chains,
-                          sabdab_summary_path):
+    return {'Hchain': h_chain, 'Lchain': l_chain}
+    
+    
+def process_chain(pdb_text, chain, resnum, newchain):
     """
-    :param pdb_id: The PDB ID of the protein
-    :param antibody_database_path:
-        The path where all the chothia numbered pdb files are stored as [pdb_id].pdb
-    :param ignore_same_VL_VH_chains:
-        Whether or not to ignore a PDB file when its VL chain and VH chains are
-    :type ignore_same_VL_VH_chains: bool
+    Read PDB line by line and return all lines for a chain,
+    with a resnum less than or equal to the input.
+    This has to be permissive for insertion codes.
+    This will return only a single truncated chain.
+    This function can update chain to newchain.
     """
-    # check if 'pdb_trunc.pdb' exists, if not then generate it
-    pdb_path = os.path.join(antibody_database_path, pdb_id + '.pdb')
-    trunc_pdb_path = os.path.join(
-        os.path.join(antibody_database_path, pdb_id + '_trunc.pdb'))
-    if os.path.isfile(trunc_pdb_path):
-        print('We think a truncated version of ' + pdb_id +
-              ' was found. Skipping.')
-        os.remove(pdb_path)  # delete old file just in case
-        return
-
-    pdb_text = ''
-    try:
-        with open(pdb_path, 'r') as f:
-            pdb_text = f.read()  # want string not list
-    except IOError:
-        sys.exit('Failed to open {} in antibody_database/ !'.format(pdb_id))
-
-    # should have pdb_text now
-    if len(pdb_text) == 0:
-        sys.exit('Nothing parsed for PDB {} !'.format(pdb_id))
-
-    # Get the hchain and lchain data from the SAbDab summary file, if givenj
-    hchain_text, lchain_text = '', ''
-    if sabdab_summary_path is not None:
-        sabdab_dict = parse_sabdab_summary(sabdab_summary_path)
-        hchain, lchain = sabdab_dict[pdb_id]["Hchain"], sabdab_dict[pdb_id][
-            "Lchain"]
-    else:
-        hchain, lchain = _get_HL_chains(pdb_path)
-
-    # we do not currently have a good way of handling VH & VL on the same chain
-    if ignore_same_VL_VH_chains and hchain == lchain:
-        same_chain.append(pdb_id)
-        print(pdb_id + ' has the VH+VL on a single chain, removing...')
-        os.remove(antibody_database_path + pdb_id + '.pdb')
-        return
-
-    if not hchain == 'NA':
-        hchain_text = truncate_chain(pdb_text, hchain, 112, 'H')
-        if len(hchain_text) == 0:
-            # could not find heavy chain -- do not overwrite, but warn!
-            warn_pdbs.append(pdb_id)
-            print('Warning, could not find ' + hchain + ' chain for ' +
-                  pdb_id + ' !')
-            print(
-                'It was not reported to be NA, so the file may have been altered!'
-            )
-            return
-
-    if not lchain == 'NA':
-        lchain_text = truncate_chain(pdb_text, lchain, 109, 'L')
-        if len(lchain_text) == 0:
-            # could not find heavy chain -- do not overwrite, but warn!
-            warn_pdbs.append(pdb_id)
-            print('Warning, could not find ' + lchain + ' chain for ' +
-                  pdb_id + ' !')
-            print(
-                'It was not reported to be NA, so the file may have been altered!'
-            )
-            return
-
-    # write new file to avoid bugs from multiple truncations
-    with open(trunc_pdb_path, 'w') as f:
-        f.write(hchain_text + lchain_text)
-
-    # remove old file
-    os.remove(antibody_database_path + pdb_id + '.pdb')
+    trunc_text = ""
+    for line in pdb_text.split("\n"):
+        if (line.startswith("ATOM") 
+            and line[21] == chain
+            and int(line[22:26]) <= resnum
+           ):
+            trunc_text += line[:21] + newchain + line[22:]
+            trunc_text += "\n"
+    return trunc_text
 
 
-def truncate_antibody_pdbs(
-        antibody_database_path=_DEFAULT_ANTIBODY_DATABASE_PATH,
-        sabdab_summary_path=_DEFAULT_SUMMARY_FILE_PATH,
-        ignore_same_VL_VH_chains=True):
-    """
-    We only use the Fv as a template, so this function loads each pdb
-    and deletes excess chains/residues. We define the Fv, under the
-    Chothia numbering scheme as H1-H112 and L1-L109.
-    """
-    warn_pdbs = []  # count warnings
-    same_chain = []  # count deleted files (VH+VL same chain)
 
-    # iterate over PDBs in antibody_database and truncate accordingly
-    unique_pdbs = set([
-        x[:4] for x in os.listdir(antibody_database_path) if x.endswith(".pdb")
-    ])
-
-    print('Truncating pdb files...')
-    for pdb in tqdm(unique_pdbs):
-        truncate_antibody_pdb(
-            pdb,
-            antibody_database_path,
-            same_chain,
-            warn_pdbs,
-            sabdab_summary_path=sabdab_summary_path,
-            ignore_same_VL_VH_chains=ignore_same_VL_VH_chains)
-
-    for pdb in same_chain:
-        print("Deleted " + pdb +
-              " from database because it has VH+VL on the same chain.")
-    print("Deleted {} total of same chain VH+VLs.".format(len(same_chain)))
-
-    if len(warn_pdbs) > 0:
-        print("Finished truncating, with {} warnings.".format(len(warn_pdbs)))
-
-    return warn_pdbs
+#---------------------------
+#         FASTAs
+#---------------------------
 
 
-def truncate_fasta_files(pdb_ids,
-                         antibody_database_path=_DEFAULT_ANTIBODY_DATABASE_PATH
-                         ):
-    warn_pdbs = []
-
-    print('Truncating fasta files...')
-    for pdb in tqdm(pdb_ids):
-        pdb_file = os.path.join(antibody_database_path,
-                                "{}_trunc.pdb".format(pdb))
-        fasta_file = os.path.join(antibody_database_path,
-                                  "{}.fasta".format(pdb))
-        truncate_fasta_for_pdb(fasta_file, pdb_file, warn_pdbs, pdb_id=pdb)
-        os.system("mv {} {}".format(
-            fasta_file,
-            os.path.join(antibody_database_path,
-                         "{}_trunc.fasta".format(pdb))))
-
-    if len(warn_pdbs) > 0:
-        print("Finished truncating, with {} warnings.".format(len(warn_pdbs)))
-
-    return warn_pdbs
-
-
-def download_file(url, output_path):
-    with open(output_path, 'w') as f:
-        f.write(requests.get(url).content.decode('utf-8'))
-
-
-def download_chothia_pdb_files(pdb_ids,
-                               antibody_database_path,
-                               max_workers=16):
-    """
-    :param pdb_ids: A set of PDB IDs to download
-    :type pdb_ids: set(str)
-    :param antibody_database_path: Path to the directory to save the PDB files to.
-    :type antibody_database_path: str
-    :param max_workers: Max number of workers in the thread pool while downloading.
-    :type max_workers: int
-    """
-    # Get PDBs to download from the summary file and the path to save each to.
-    pdb_file_paths = [
-        os.path.join(antibody_database_path, pdb + '.pdb') for pdb in pdb_ids
-    ]
-
-    # Download PDBs using multiple threads
-    download_url = 'http://opig.stats.ox.ac.uk/webapps/newsabdab/sabdab/pdb/{}/?scheme=chothia'
-    urls = [download_url.format(pdb) for pdb in pdb_ids]
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        results = [
-            executor.submit(lambda a: download_file(*a), args)
-            for args in zip(urls, pdb_file_paths)
-        ]
-        print('Downloading chothia files to {}/ from {} ...'.format(
-            antibody_database_path, download_url))
-        for _ in tqdm(as_completed(results), total=len(urls)):
-            pass
-
-
-def download_fasta_files(pdb_ids, antibody_database_path, max_workers=16):
-    """
+def download_fasta_files(pdb_ids, download_dir, max_workers=16, sleep=None, logfile=None):
+    '''
     :param pdb_ids: A set of PDB IDs to download
     :type pdb_ids: set(str)
     :param antibody_database_path: Path to the directory to save the fasta files to.
     :type antibody_database_path: str
     :param max_workers: Max number of workers in the thread pool while downloading.
     :type max_workers: int
-    """
-    # Get fastas to download from the summary file and the path to save each to.
-    fasta_file_paths = [
-        os.path.join(antibody_database_path, pdb + '.fasta') for pdb in pdb_ids
-    ]
-
-    # Download fastas using multiple threads
+    '''
+    # download FASTA files
+    fasta_files = [os.path.join(download_dir, pdb + '.fasta') for pdb in pdb_ids]
     download_url = 'https://www.rcsb.org/fasta/entry/{}'
     urls = [download_url.format(pdb) for pdb in pdb_ids]
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         results = [
-            executor.submit(lambda a: download_file(*a), args)
-            for args in zip(urls, fasta_file_paths)
+            executor.submit(lambda a: download_file(*a, sleep=sleep), args)
+            for args in zip(urls, fasta_files)
         ]
-        print('Downloading fasta files to {}/ from {} ...'.format(
-            antibody_database_path, download_url))
+        print('\ndownloading FASTA files:')
+        sys.stdout.flush()
         for _ in tqdm(as_completed(results), total=len(urls)):
             pass
-
-
-def download_and_truncate_pdbs(pdb_ids, antibody_database_path,
-                               sabdab_summary_path, ignore_same_VL_VH_chains):
+    sys.stdout.flush()
+    downloaded_files = list_files(download_dir)
+    
+    # logging
+    log_info = []
+    n_downloads = len(downloaded_files)
+    n_pdbs = len(pdb_ids)
+    i = f"{n_downloads} of {n_pdbs} FASTAs were successfully downloaded"
+    print(i)
+    sys.stdout.flush()
+    log_info.append(i)
+    if n_pdbs > n_downloads:
+        failed = []
+        for pdb_id in pdb_ids:
+            if not any([pdb_id in df for df in downloaded_files]):
+                failed.append(pdb_id)
+        log_info.append('The following PDB IDs were not downloaded:')
+        log_info.extend(failed)
+    
+    if logfile is not None:
+        write_log(logfile, '\n'.join(log_info))
+        
+        
+def process_fastas(pdb_ids, 
+                   raw_fasta_dir, 
+                   processed_fasta_dir, 
+                   pdb_dir,
+                   logfile=None):
+    '''
+    
+    '''
+    # process FASTA files and record any failures
     warn_pdbs = []
+    missing_pdbs = []
+    print('\nprocessing fasta files:')
+    sys.stdout.flush()
+    for pdb_id in tqdm(pdb_ids):
+        pdb_file = os.path.join(pdb_dir, f"{pdb_id}.pdb")
+        if not os.path.isfile(pdb_file):
+            missing_pdbs.append(pdb_id)
+            continue
+        raw_fasta_file = os.path.join(raw_fasta_dir, f"{pdb_id}.fasta")
+        processed_fasta_file = os.path.join(processed_fasta_dir, f"{pdb_id}.fasta")
+        warn = process_fasta(raw_fasta_file, 
+                             processed_fasta_file,
+                             pdb_file, 
+                             pdb_id)
+        if warn is not None:
+            warn_pdbs.append(warn)
 
-    download_chothia_pdb_files(pdb_ids=pdb_ids,
-                               antibody_database_path=antibody_database_path)
-    warn_pdbs += truncate_antibody_pdbs(
-        antibody_database_path=antibody_database_path,
-        sabdab_summary_path=sabdab_summary_path,
-        ignore_same_VL_VH_chains=ignore_same_VL_VH_chains)
-    download_fasta_files(pdb_ids,
-                         antibody_database_path=antibody_database_path)
-    warn_pdbs += truncate_fasta_files(
-        pdb_ids, antibody_database_path=antibody_database_path)
-
-    if len(warn_pdbs) > 0:
-        print("Removing {} PDBs from antibody database".format(len(warn_pdbs)))
-        for pdb in warn_pdbs:
-            os.system("rm {}".format(
-                os.path.join(antibody_database_path, "{}*".format(pdb))))
-
-
-def download_sabdab_summary_file(summary_file_path=_DEFAULT_SUMMARY_FILE_PATH,
-                                 seqid=99,
-                                 paired=True,
-                                 nr_complex='All',
-                                 nr_rfactor='',
-                                 nr_res=4):
-    base_url = 'http://opig.stats.ox.ac.uk'
-    search_url = base_url + '/webapps/newsabdab/sabdab/search/'
-    params = dict(seqid=seqid,
-                  paired=paired,
-                  nr_complex=nr_complex,
-                  nr_rfactor=nr_rfactor,
-                  nr_res=nr_res)
-    query = requests.get(search_url, params=params)
-    html = BeautifulSoup(query.content, 'html.parser')
-    summary_file_url = base_url + html.find(
-        id='downloads').find('a').get('href')
-    print('Downloading sabdab summary to {} from: {} ...'.format(
-        summary_file_path, summary_file_url))
-
-    os.makedirs(os.path.split(summary_file_path)[0], exist_ok=True)
-    download_file(summary_file_url, summary_file_path)
-
-
-def download_test_dataset(test_set_path='test_set/'):
-    # Change the working directory to the deepab/data directory
-    original_dir = os.getcwd()
-    project_path = os.path.abspath(os.path.join(deepab.__file__, "../.."))
-    data_dir = Path(os.path.join(project_path, "data"))
-    os.chdir(data_dir)
-
-    dir_ = test_set_path
-    if os.path.isdir(dir_):
-        print('Clearing {} directory...'.format(dir_))
-        for file in os.listdir(dir_):
-            os.remove(os.path.join(dir_, file))
+    # logging
+    log_info = []
+    if missing_pdbs:
+        i = f'Processed PDB files were not found for {len(missing_pdbs)} PDB IDs'
+        print(i)
+        sys.stdout.flush()
+        log_info.append(i + ':')
+        log_info.append(', '.join(missing_pdbs))
+    if warn_pdbs:
+        w, s = ('were', 's') if len(warn_pdbs) > 1 else ('was', '')
+        i = f"During processing, there {w} {len(warn_pdbs)} warning{s}"
+        print(i)
+        sys.stdout.flush()
+        log_info.append(i + ':')
+        log_info.append('\n'.join(warn_pdbs))
     else:
-        print('Making {} directory...'.format(dir_))
-        os.mkdir(dir_)
+        log_info.append('All FASTA files were successfully processed')
+    if logfile is not None:
+        write_log(logfile, '\n'.join(log_info))
+        
 
-    test_dataset = pd.read_csv(str(data_dir.joinpath(_TESTSET_FILENAME_)))
-    pdb_ids = set(test_dataset['PDB_ID'].unique())
+def process_fasta(raw_fasta_file,
+                  processed_fasta_file,
+                  pdb_file,
+                  pdb_id):
+    '''
 
-    download_and_truncate_pdbs(pdb_ids,
-                               test_set_path,
-                               sabdab_summary_path=None,
-                               ignore_same_VL_VH_chains=False)
+    '''
+    # read input FASTA file
+    fasta_seqs = []
+    for record in SeqIO.parse(raw_fasta_file, "fasta"):
+        s = record.seq._data
+        if type(s) == bytes:
+            s = s.decode()
+        fasta_seqs.append(s)
+    if not fasta_seqs:
+        err = f"NO FASTA SEQS: {pdb_id}\n"
+        with open(raw_fasta_file, 'r') as f:
+            err += f.read()
+        return err
 
-    os.chdir(original_dir)
+    # verify that both H and L chains are present
+    try:
+        pdb_h_seq = get_pdb_chain_seq(pdb_file, "H")
+    except Exception as e:
+        err = f'GET PDB H SEQ ERROR: {pdb_id}\n'
+        err += traceback.format_exc()
+        err += '\n'
+        return err
+    try:
+        pdb_l_seq = get_pdb_chain_seq(pdb_file, "L")
+    except Exception as e:
+        err = f'GET PDB L SEQ ERROR: {pdb_id}\n'
+        err += traceback.format_exc()
+        err += '\n'
+        return err
+    if pdb_h_seq == None or len(pdb_h_seq) == 0:
+        err = f'MISSING H CHAIN: {pdb_id}'
+        return err
+    if pdb_l_seq == None or len(pdb_l_seq) == 0:
+        err = f'MISSING L CHAIN: {pdb_id}'
+        return err
+
+    # truncate the C-terminal end of H/L sequences
+    cterm_length = 15
+    trunc_h_seq = None
+    h_cterm_seq = pdb_h_seq[-cterm_length:]
+    for s in fasta_seqs:
+        if h_cterm_seq in s:
+            trunc_h_seq = s[:s.index(h_cterm_seq) + cterm_length]
+    if trunc_h_seq is None:
+        err = []
+        err.append(f"\n\n{pdb_id}: H")
+        alns = local_alignment(pdb_h_seq, targets=fasta_seqs)
+        for aln in alns:
+            err.append(aln.aligned_query)
+            err.append(aln.alignment_midline)
+            err.append(aln.aligned_target)
+            return '\n'.join(err)
+    trunc_l_seq = None
+    l_cterm_seq = pdb_l_seq[-cterm_length:]
+    for s in fasta_seqs:
+        if l_cterm_seq in s:
+            trunc_l_seq = s[:s.index(l_cterm_seq) + cterm_length]
+    if trunc_l_seq is None:
+        err = []
+        err.append(f"\n\n{pdb_id}: L")
+        alns = local_alignment(pdb_l_seq, targets=fasta_seqs)
+        for aln in alns:
+            err.append(aln.aligned_query)
+            err.append(aln.alignment_midline)
+            err.append(aln.aligned_target)
+            return '\n'.join(err)
+
+    # write the truncated sequences to file
+    try:
+        with open(processed_fasta_file, "w") as f:
+            f.write(">{0}:H\n{1}\n>{0}:L\n{2}\n\n".format(
+                pdb_id, trunc_h_seq, trunc_l_seq))
+    except:
+        err = []
+        err.append("Failed to write truncated fasta for PDB ID {}".format(pdb_id))
+        err.append("\tFasta file\t{}".format(raw_fasta_file))
+        err.append("\tPDB file\t{}".format(pdb_file))
+        return '\n'.join(err)
 
 
-def download_train_dataset(
-        summary_file_path=_DEFAULT_SUMMARY_FILE_PATH,
-        antibody_database_path=_DEFAULT_ANTIBODY_DATABASE_PATH,
-        download_summary_file=True,
-        paired=False,
-        **kwargs):
+
+#---------------------------
+#          utils
+#---------------------------
+
+
+def download_file(url, download_path, sleep=None):
+    os.makedirs(os.path.dirname(download_path), exist_ok=True)
+    if sleep is not None:
+        time.sleep(sleep)
+    with open(download_path, 'w') as f:
+        f.write(requests.get(url).content.decode('utf-8'))
+
+
+def write_log(log_file, log_data):
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+    with open(log_file, 'w') as f:
+        f.write(log_data)
+
+
+
+#---------------------------
+#          main
+#---------------------------
+
+
+def download_dataset(pdb_ids,
+                     download_path,
+                     sabdab_summary_file,
+                     ignore_single_chains=True):
     """
     Downloads a training set from SAbDab, avoids downloading PDB files in the
     deepab/data/TestSetList.txt file.
@@ -443,85 +590,119 @@ def download_train_dataset(
     :param max_workers: Max number of workers in the thread pool while downloading.
     :type max_workers: int
     """
-    # Change the working directory to the deepab/data directory
-    original_dir = os.getcwd()
-    project_path = os.path.abspath(os.path.join(deepab.__file__, "../.."))
-    data_dir = Path(os.path.join(project_path, "data"))
-    os.chdir(data_dir)
+    # make required directories if they don't already exist
+    raw_pdb_dir = os.path.join(download_path, 'raw_pdbs')
+    processed_pdb_dir = os.path.join(download_path, 'pdbs')
+    raw_fasta_dir = os.path.join(download_path, 'raw_fastas')
+    processed_fasta_dir = os.path.join(download_path, 'fastas')
+    log_dir = os.path.join(download_path, 'log')
+    all_dirs = [raw_pdb_dir, processed_pdb_dir, raw_fasta_dir, processed_fasta_dir, log_dir]
+    for d in all_dirs:
+        os.makedirs(d, exist_ok=True)
+    
+    # download and process PDB files
+    download_pdb_files(pdb_ids,
+                       raw_pdb_dir,
+                       logfile=os.path.join(log_dir, 'download_pdbs.txt'))
+    process_pdbs(raw_pdb_dir,
+                 processed_pdb_dir,
+                 sabdab_summary_file,
+                 ignore_single_chains,
+                 logfile=os.path.join(log_dir, 'process_pdbs.txt'))
+        
 
-    # Make required directories. If they already exist, delete all contents
-    dir_ = antibody_database_path
-    if os.path.isdir(dir_):
-        print('Clearing {} directory...'.format(dir_))
-        for file in os.listdir(dir_):
-            os.remove(os.path.join(dir_, file))
+    # download and process FASTA files
+    download_fasta_files(pdb_ids,
+                         raw_fasta_dir, 
+                         sleep=0.5, 
+                         logfile=os.path.join(log_dir, 'download_fastas.txt'))
+    process_fastas(pdb_ids,
+                   raw_fasta_dir,
+                   processed_fasta_dir,
+                   processed_pdb_dir,
+                   logfile=os.path.join(log_dir, 'process_fastas.txt'))
+
+
+def run(input_file,
+        download_path, 
+        exclude_file=None, 
+        sabdab_summary_file=None,
+        ignore_single_chains=True,
+        seqid=99,
+        paired=True,
+        nr_complex='All',
+        nr_rfactor='',
+        nr_res=4.0):
+    '''
+    
+    '''
+    # assemble the list of PDB IDs to download
+    with open(input_file, 'r') as f:
+        pdb_ids = [line.strip() for line in f]
+    if exclude_file is not None:
+        with open(exclude_file, 'r') as f:
+            exclude = [line.strip() for line in f]
     else:
-        print('Making {} directory...'.format(dir_))
-        os.mkdir(dir_)
+        exclude = []
+    pdb_ids = [p for p in pdb_ids if p not in exclude]
 
-    # Get all the PDB ID's for the training set
-    if download_summary_file:
-        download_sabdab_summary_file(summary_file_path=summary_file_path,
-                                     **kwargs)
-    summary_dataframe = pd.read_csv(summary_file_path, sep='\t')
-    all_pdbs = set(summary_dataframe['pdb'].unique())
+    # download the SAbDab summary file if not provided
+    if sabdab_summary_file is None:
+        os.makedirs(download_path, exist_ok=True)
+        sabdab_summary_file = os.path.join(download_path, 'sabdab_summary.tsv')
+        download_sabdab_summary_file(sabdab_summary_file,
+                                    seqid=seqid,
+                                    paired=paired,
+                                    nr_complex=nr_complex,
+                                    nr_rfactor=nr_rfactor,
+                                    nr_res=nr_res)
 
-    # Remove PDB's that appear in the test set
-    test_dataset = pd.read_csv(str(data_dir.joinpath(_TESTSET_FILENAME_)))
-    test_dataset['PDB_ID'] = test_dataset['PDB_ID'].str.lower()
-    training_set_ids = all_pdbs - set(test_dataset['PDB_ID'].unique())
+    # download and process the dataset
+    download_dataset(pdb_ids,
+                     download_path,
+                     sabdab_summary_file,
+                     ignore_single_chains=ignore_single_chains)
 
-    download_and_truncate_pdbs(training_set_ids,
-                               antibody_database_path,
-                               sabdab_summary_path=summary_file_path,
-                               ignore_same_VL_VH_chains=paired)
-
-    os.chdir(original_dir)  # Go back to original working dir
 
 
 def _cli():
     desc = ('''
         Downloads chothia files from SAbDab
         ''')
-    parser = argparse.ArgumentParser(
-        description=desc, formatter_class=RawTextArgumentDefaultsHelpFormatter)
-    parser.add_argument('--seqid',
-                        type=int,
-                        default=99,
-                        help='Max sequence identity (%)')
-    parser.add_argument('--paired',
-                        default=True,
-                        action="store_true",
-                        help='Paired VH/VL only?')
-    parser.add_argument(
-        '--nr_complex',
-        type=str,
-        default='All',
-        help='In complex? "All", "Bound only" or "Unbound only"')
-    parser.add_argument('--nr_rfactor',
-                        type=str,
-                        default='',
-                        help='R-Factor cutoff')
-    parser.add_argument('--nr_res',
-                        type=int,
-                        default=4,
-                        help='Resolution cutoff')
-    parser.add_argument(
-        '--summary_file',
-        default=None,
-        help='Summary file to use (will download if not provided)')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-i', '--input', type=str,
+                        help="Input file containing PDB IDs, one per line. Required.")
+    parser.add_argument('-d', '--download_path', type=str,
+                         help="Path to the download directory. If it does not exist, it will be created.")
+    parser.add_argument('--exclude-file', type=str, default=None,
+                        help="File containing PDB IDs to exclude from the download list. Useful if you have a test set that you want to ensure is not included when downloading a training set. Default is None.")
+    parser.add_argument('--seqid', type=int, default=99,
+                        help='Max sequence identity (%) allowed between two sequences downloaded from SAbDab. Default is 99')
+    parser.add_argument('--allow-unpaired', dest='paired', default=True, action="store_false",
+                        help='If set, allow downloading of unpaired Ab sequences from SAbDab. Default is False, which only downloads paired sequences.')
+    parser.add_argument('--nr_complex', type=str, default='All', choices=['All', 'Bound only', 'Unbound only'],
+                        help='In complex? Choices are: "All", "Bound only" or "Unbound only". Default is "All".')
+    parser.add_argument('--nr_rfactor', type=str, default='',
+                        help='R-Factor cutoff. Default is not to use a cutoff')
+    parser.add_argument('--nr_res', type=int, default=4,
+                        help='Resolution cutoff, in Angstroms. Default is 4')
+    parser.add_argument('--sabdab-summary-file', default=None,
+                        help='SAbDab summary file to use. If not provided, the summary file will be downloaded.')
+    parser.add_argument('--allow-single-chains', default=True, action='store_false', dest='ignore_single_chains',
+                        help='Allows H/L pairs that are on a single chain (scFv). Unlikely to work well, so use at your own risk.')
     args = parser.parse_args()
 
-    summary_file = _DEFAULT_SUMMARY_FILE_PATH if args.summary_file == None else args.summary_file
-    download_summary_file = summary_file == None or not os.path.isfile(
-        summary_file)
-    download_train_dataset(download_summary_file=download_summary_file,
-                           summary_file_path=summary_file,
-                           seqid=args.seqid,
-                           paired=args.paired,
-                           nr_complex=args.nr_complex,
-                           nr_rfactor=args.nr_rfactor,
-                           nr_res=args.nr_res)
+    run(args.input,
+        args.download_path,
+        exclude_file=args.exclude_file,
+        sabdab_summary_file=args.sabdab_summary_file,
+        ignore_single_chains=args.ignore_single_chains,
+        seqid=args.seqid,
+        paired=args.paired,
+        nr_complex=args.nr_complex,
+        nr_rfactor=args.nr_rfactor,
+        nr_res=args.nr_res)
+
 
 
 if __name__ == '__main__':

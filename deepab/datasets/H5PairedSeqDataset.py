@@ -65,6 +65,26 @@ class H5PairedSeqDataset(data.Dataset):
         return H5AntibodyBatch(zip(*samples)).data()
 
 
+class H5PairedSeqDatasetPreloaded(data.Dataset):
+    """
+    Dataset containing paired sequence for training PairedSeqLSTM
+    """
+    def __init__(self, df):
+        super(H5PairedSeqDatasetPreloaded, self).__init__()
+        self.df = df
+
+    def __getitem__(self, index):
+        d = self.df.iloc[index]
+        return d['heavy'], d['light']
+
+    def __len__(self):
+        return self.df.shape[0]
+
+    @staticmethod
+    def merge_samples_to_minibatch(samples):
+        return H5AntibodyBatchPreloaded(zip(*samples)).data()
+
+
 class H5AntibodyBatch:
     def __init__(self, batch_data):
         (self.index, self.heavy_prim, self.light_prim, self.cdrs,
@@ -99,6 +119,37 @@ class H5AntibodyBatch:
         ]
         combined_seqs = pad_data_to_same_shape(combined_seqs, pad_value=22)
 
+        return combined_seqs.long()
+
+
+class H5AntibodyBatchPreloaded:
+    def __init__(self, batch_data):
+        (self.heavy_prim, self.light_prim) = batch_data
+
+    def data(self):
+        return self.features(), self.labels(),
+
+    def features(self):
+        seq_start, seq_end, seq_delim = torch.tensor(
+            [20]).byte(), torch.tensor([21]).byte(), torch.tensor([22]).byte()
+        combined_seqs = [
+            torch.cat([seq_start, h, seq_delim, l, seq_end])
+            for h, l in zip(self.heavy_prim, self.light_prim)
+        ]
+        combined_seqs = pad_data_to_same_shape(combined_seqs, pad_value=22)
+        combined_seqs = torch.stack(
+            [F.one_hot(seq.long()) for seq in combined_seqs])
+        combined_seqs = combined_seqs.transpose(0, 1)
+        return combined_seqs
+
+    def labels(self):
+        seq_start, seq_end, seq_delim = torch.tensor(
+            [20]).byte(), torch.tensor([21]).byte(), torch.tensor([22]).byte()
+        combined_seqs = [
+            torch.cat([seq_start, h, seq_delim, l, seq_end])
+            for h, l in zip(self.heavy_prim, self.light_prim)
+        ]
+        combined_seqs = pad_data_to_same_shape(combined_seqs, pad_value=22)
         return combined_seqs.long()
 
 

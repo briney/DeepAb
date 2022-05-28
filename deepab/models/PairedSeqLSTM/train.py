@@ -1,6 +1,8 @@
 import argparse
 import torch
+import h5py
 import os
+import pandas as pd
 from tqdm import tqdm
 from datetime import datetime
 import torch.nn as nn
@@ -10,10 +12,10 @@ from torch.utils.tensorboard import SummaryWriter
 import deepab
 from deepab.models.PairedSeqLSTM import PairedSeqLSTM
 from deepab.util.util import RawTextArgumentDefaultsHelpFormatter
-from deepab.datasets.H5PairedSeqDataset import H5PairedSeqDataset
+from deepab.datasets.H5PairedSeqDataset import H5PairedSeqDataset, H5PairedSeqDatasetPreloaded
 
 
-def train_epoch(model, train_loader, criterion, optimizer, device):
+def train_epoch(model, train_loader, criterion, optimizer, device, show_loss_every):
     """Trains a model for one epoch"""
     model.train()
     running_loss = 0
@@ -40,7 +42,7 @@ def train_epoch(model, train_loader, criterion, optimizer, device):
         loss = handle_batch()
         running_loss += loss
 
-        if e_i % 100 == 0:
+        if e_i % show_loss_every == 0:
             print(loss)
         e_i += 1
         # running_loss += handle_batch()
@@ -83,6 +85,7 @@ def train(model,
           writer,
           save_file,
           save_every,
+          show_loss_every,
           properties=None):
     """"""
     properties = {} if properties is None else properties
@@ -91,7 +94,7 @@ def train(model,
 
     for epoch in range(epochs):
         train_loss = train_epoch(model, train_loader, criterion, optimizer,
-                                 device)
+                                 device, show_loss_every)
         avg_train_loss = train_loss / len(train_loader)
         train_loss_dict = {"cce": avg_train_loss}
         writer.add_scalars('train_loss', train_loss_dict, global_step=epoch)
@@ -151,13 +154,16 @@ def _get_args():
     # Training arguments
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--save_every', type=int, default=10)
+    parser.add_argument('--show_loss_every', type=int, default=100)
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--lr', type=float, default=0.01)
+    parser.add_argument('--lr_modifier_patience', type=int, default=10)
     parser.add_argument('--use_gpu', default=False, action="store_true")
     parser.add_argument('--train_split', type=float, default=0.95)
 
     default_h5_file = os.path.join(project_path, 'data/abSeq.h5')
     parser.add_argument('--h5_file', type=str, default=default_h5_file)
+    parser.add_argument('--preload', type=bool, default=False)
 
     now = str(datetime.now().strftime('%y-%m-%d %H:%M:%S'))
     default_model_path = os.path.join(project_path,
@@ -186,7 +192,31 @@ def _cli():
 
     # Load dataset loaders from h5 file
     h5_file = args.h5_file
-    dataset = H5PairedSeqDataset(h5_file)
+    if args.preload:
+        h_tensors = []
+        l_tensors = []
+        print('\nloading HDF5 data:')
+        with h5py.File(h5_file, 'r') as h5file:
+            heavy_chain_seq_len = h5file['heavy_chain_seq_len']
+            light_chain_seq_len = h5file['light_chain_seq_len']
+            heavy_chain_primary = h5file['heavy_chain_primary']
+            light_chain_primary = h5file['light_chain_primary']
+            total = heavy_chain_seq_len.shape[0]
+            for hlen, llen, hprim, lprim in tqdm(zip(heavy_chain_seq_len[:total],
+                                                    light_chain_seq_len[:total],
+                                                    heavy_chain_primary[:total],
+                                                    light_chain_primary[:total]),
+                                                total=total, miniters=total/1000):
+                htensor = torch.Tensor(hprim[:hlen]).type(dtype=torch.uint8)
+                ltensor = torch.Tensor(lprim[:llen]).type(dtype=torch.uint8)
+                h_tensors.append(htensor)
+                l_tensors.append(ltensor)
+        print('building Paired Seq Dataset')
+        df = pd.DataFrame({'heavy': h_tensors, 'light': l_tensors})
+        dataset = H5PairedSeqDatasetPreloaded(df)
+    else:
+        dataset = H5PairedSeqDataset(h5_file)
+
     train_split_length = int(len(dataset) * args.train_split)
     torch.manual_seed(0)
     train_dataset, validation_dataset = data.random_split(
@@ -202,6 +232,7 @@ def _cli():
         collate_fn=H5PairedSeqDataset.merge_samples_to_minibatch)
 
     lr_modifier = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer,
+                                                             patience=args.lr_modifier_patience,
                                                              verbose=True)
     out_dir = args.output_dir
     if not os.path.isdir(out_dir):
@@ -223,6 +254,7 @@ def _cli():
           writer=writer,
           save_file=os.path.join(out_dir, 'model.p'),
           save_every=args.save_every,
+          show_loss_every=args.show_loss_every,
           properties=properties)
 
 
